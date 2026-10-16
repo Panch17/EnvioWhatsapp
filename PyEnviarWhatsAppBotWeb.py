@@ -8,29 +8,66 @@ import sys
 import argparse
 import time
 import random
-import pyodbc
 from datetime import datetime
 import subprocess
 import os
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
+from ctypes import wintypes
+import socket
+
+try:
+    import pyodbc
+except ImportError:
+    pyodbc = None
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+
+def es_horario_laboral(dt=None):
+    """
+    Verifica si el momento actual (o el datetime provisto) está dentro del horario laboral.
+    Horario laboral:
+    - Lunes a Viernes (0-4): 07:00 a 17:00 (7am - 5pm)
+    - Sábados (5): 07:00 a 14:00 (7am - 2pm)
+    - Domingos (6): Sin atención
+    """
+    if dt is None:
+        dt = datetime.now()
+    dia = dt.weekday()
+    hora = dt.hour
+    if 0 <= dia <= 4:
+        return 7 <= hora < 17
+    elif dia == 5:
+        return 7 <= hora < 14
+    return False
+
 
 class WhatsAppBotWeb:
-    def __init__(self, bot_id=1):
+    def __init__(self, bot_id=1, excel_path=None, force_excel=False):
         """
         bot_id: 1 o 2 — indica qué instancia de WhatsApp usar.
           Bot 1: Chrome puerto 9222, perfil ChromeWhatsApp1
           Bot 2: Chrome puerto 9223, perfil ChromeWhatsApp2
+        excel_path: ruta al archivo de Excel para ambiente de pruebas.
+        force_excel: fuertemente fuerza el uso de Excel en lugar de SQL Server.
         """
         self.bot_id = bot_id
-        self.debug_port = 9221 + bot_id          # 9222 para bot 1, 9223 para bot 2
+        self.debug_port = 9221 + bot_id  # 9222 para bot 1, 9223 para bot 2
         self.user_data_dir = rf"C:\Temp\ChromeWhatsApp{bot_id}"
+        self.excel_path = excel_path or "ambiente_pruebas.xlsx"
+        self.force_excel = force_excel or os.path.exists(self.excel_path) or pyodbc is None
         print(f"INICIO DEL PROCESO — Bot {bot_id} (puerto {self.debug_port})")
+        if self.force_excel:
+            print(f"ℹ️ Bot {bot_id}: Operando en Ambiente de Pruebas con Excel: {self.excel_path}")
         self.driver = None
         self.ensure_chrome_running()
 
     # -------------------------------------------------------
-    # Helpers de timing
+    # Helpers de timing y texto
     # -------------------------------------------------------
     def _pausa_corta(self):
         """Pausa aleatoria corta (simula reacción humana)"""
@@ -52,7 +89,7 @@ class WhatsAppBotWeb:
 
     def _escribir_mensaje_normal(self, elemento, mensaje):
         """Escritura más natural para mensajes: rápida, con micro-pausas por puntuación."""
-        for char in mensaje:
+        for char in str(mensaje):
             if char == "\n":
                 elemento.send_keys(Keys.SHIFT + Keys.ENTER)
                 time.sleep(random.uniform(0.15, 0.35))
@@ -77,12 +114,12 @@ class WhatsAppBotWeb:
             try:
                 self.driver.find_element(By.XPATH, "//div[@data-testid='conversation-compose-box-input']")
                 return True
-            except:
+            except Exception:
                 pass
             try:
                 self.driver.find_element(By.XPATH, "//footer")
                 return True
-            except:
+            except Exception:
                 pass
             time.sleep(0.2)
         return False
@@ -114,7 +151,7 @@ class WhatsAppBotWeb:
                 titulo = (elem.get_attribute("title") or elem.text or "").strip()
                 if titulo:
                     return titulo
-            except:
+            except Exception:
                 continue
         return ""
 
@@ -136,13 +173,13 @@ class WhatsAppBotWeb:
                 valor = elemento.get_attribute(atributo)
                 if valor:
                     partes.append(valor)
-        except:
+        except Exception:
             pass
 
         try:
             if elemento.text:
                 partes.append(elemento.text)
-        except:
+        except Exception:
             pass
 
         try:
@@ -150,7 +187,7 @@ class WhatsAppBotWeb:
                 valor = subelem.get_attribute("title") or subelem.text
                 if valor:
                     partes.append(valor)
-        except:
+        except Exception:
             pass
 
         return self._normalizar_texto(" ".join(partes))
@@ -169,7 +206,7 @@ class WhatsAppBotWeb:
                 try:
                     contenedor = candidato.find_element(By.XPATH, ".//div[@data-testid='cell-frame-container']")
                     self.driver.execute_script("arguments[0].click();", contenedor)
-                except:
+                except Exception:
                     self.driver.execute_script("arguments[0].click();", candidato)
                 return True
         return False
@@ -177,10 +214,9 @@ class WhatsAppBotWeb:
     def _abrir_grupo_por_nombre(self, nombre_grupo):
         objetivo = self._normalizar_texto(nombre_grupo)
 
-        # 1) Prioridad: coincidencia exacta por atributo title dentro del panel lateral.
+        # 1) Coincidencia exacta por atributo title dentro del panel lateral
         try:
             spans = self.driver.find_elements(By.XPATH, "//div[@id='pane-side']//span[@title]")
-            self._debug_log(f"Spans con title detectados: {len(spans)} para '{nombre_grupo}'")
             for sp in spans:
                 titulo = self._normalizar_texto(sp.get_attribute("title") or sp.text)
                 if titulo == objetivo:
@@ -188,19 +224,14 @@ class WhatsAppBotWeb:
                         fila = sp.find_element(By.XPATH, "./ancestor::div[@role='row'][1]")
                         contenedor = fila.find_element(By.XPATH, ".//div[@data-testid='cell-frame-container']")
                         self.driver.execute_script("arguments[0].click();", contenedor)
-                    except:
+                    except Exception:
                         self.driver.execute_script("arguments[0].click();", sp)
-                    self._debug_log(f"Coincidencia exacta encontrada y clic en '{nombre_grupo}'")
                     return True
-        except:
+        except Exception:
             pass
 
-        # 2) Respaldo: coincidencia por texto visible de la fila.
-        seleccionado = self._seleccionar_resultado_visible(nombre_grupo)
-        self._debug_log(
-            f"Coincidencia por texto visible para '{nombre_grupo}': {'SI' if seleccionado else 'NO'}"
-        )
-        return seleccionado
+        # 2) Respaldo: coincidencia por texto visible de la fila
+        return self._seleccionar_resultado_visible(nombre_grupo)
 
     def _hay_resultado_grupo_visible(self, nombre_grupo):
         objetivo = self._normalizar_texto(nombre_grupo)
@@ -210,10 +241,9 @@ class WhatsAppBotWeb:
             for sp in spans:
                 titulo = self._normalizar_texto(sp.get_attribute("title") or sp.text)
                 if titulo == objetivo:
-                    self._debug_log(f"Resultado exacto visible por title para '{nombre_grupo}'")
                     return True
-        except Exception as e:
-            self._debug_log(f"Error revisando spans title para '{nombre_grupo}': {e}")
+        except Exception:
+            pass
 
         try:
             filas = self.driver.find_elements(
@@ -223,23 +253,21 @@ class WhatsAppBotWeb:
             for fila in filas:
                 texto = self._texto_resultado_visible(fila)
                 if texto and objetivo in texto:
-                    self._debug_log(f"Resultado visible por texto para '{nombre_grupo}'")
                     return True
-        except Exception as e:
-            self._debug_log(f"Error revisando filas visibles para '{nombre_grupo}': {e}")
+        except Exception:
+            pass
 
         return False
 
     def _abrir_primer_resultado_busqueda(self, caja_busqueda, termino):
-        # Estrategia 1: navegación de teclado (robusta ante cambios de DOM)
+        # Estrategia 1: navegación de teclado
         try:
             caja_busqueda.send_keys(Keys.ARROW_DOWN)
             time.sleep(0.2)
             caja_busqueda.send_keys(Keys.ENTER)
-            self._debug_log(f"Primer resultado abierto con ARROW_DOWN+ENTER para '{termino}'")
             return True
-        except Exception as e:
-            self._debug_log(f"Falló ARROW_DOWN+ENTER para '{termino}': {e}")
+        except Exception:
+            pass
 
         # Estrategia 2: click al primer row/cell-frame disponible en side/pane-side
         xpaths_primer_resultado = [
@@ -254,40 +282,65 @@ class WhatsAppBotWeb:
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
                 self.driver.execute_script("arguments[0].click();", elem)
-                self._debug_log(f"Primer resultado abierto con click xpath: {xpath}")
                 return True
             except Exception:
                 continue
 
-        self._debug_log(f"No se pudo abrir primer resultado para '{termino}'")
         return False
 
     # -------------------------------------------------------
-    # Chrome
+    # Chrome y gestión de ventanas
     # -------------------------------------------------------
+    def _puerto_en_uso(self, puerto):
+        """Verifica si el puerto de depuración de Chrome ya está abierto"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            return s.connect_ex(('127.0.0.1', puerto)) == 0
+
+    def _obtener_ruta_chrome(self):
+        """Busca el ejecutable de Chrome en rutas estándar según el SO"""
+        rutas_posibles = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        ]
+        for ruta in rutas_posibles:
+            if os.path.isfile(ruta):
+                return ruta
+        return "chrome"
+
     def ensure_chrome_running(self):
         """Asegura que Chrome esté ejecutándose en modo debug y conectado a WhatsApp"""
-        chrome_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
         user_data_dir = self.user_data_dir
-        debug_port   = self.debug_port
-        
-        # Crear directorio de perfil si no existe
+        debug_port = self.debug_port
+
         if not os.path.exists(user_data_dir):
-            os.makedirs(user_data_dir)
-        
-        # Iniciar Chrome en modo debug con el puerto y perfil de este bot
-        cmd = f'"{chrome_path}" --remote-debugging-port={debug_port} --user-data-dir="{user_data_dir}"'
-        subprocess.Popen(cmd, shell=True)
-        time.sleep(6)  # Esperar a que Chrome se inicie completamente
-        
-        # Intentar conectar con reintentos
+            try:
+                os.makedirs(user_data_dir)
+            except Exception as e:
+                print(f"⚠️ No se pudo crear directorio {user_data_dir}: {e}")
+
+        # Iniciar Chrome si el puerto no responde
+        if not self._puerto_en_uso(debug_port):
+            chrome_path = self._obtener_ruta_chrome()
+            cmd = f'"{chrome_path}" --remote-debugging-port={debug_port} --user-data-dir="{user_data_dir}"'
+            try:
+                subprocess.Popen(cmd, shell=True)
+                time.sleep(4)
+            except Exception as e:
+                print(f"❌ Error lanzando proceso de Chrome: {e}")
+
+        # Intentar conectar con Selenium webdriver
         for intento in range(3):
             try:
                 options = webdriver.ChromeOptions()
                 options.add_experimental_option("debuggerAddress", f"127.0.0.1:{debug_port}")
                 self.driver = webdriver.Chrome(options=options)
                 self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                self.driver.maximize_window()
                 self._ir_a_whatsapp()
                 self._ensure_window_visible()
                 print(f"✅ Chrome Bot {self.bot_id} conectado correctamente (puerto {debug_port})")
@@ -295,7 +348,7 @@ class WhatsAppBotWeb:
             except Exception as e:
                 if intento < 2:
                     print(f"🔄 Reintentando conexión Bot {self.bot_id} ({intento + 1}/3)...")
-                    time.sleep(5)
+                    time.sleep(3)
                 else:
                     print(f"❌ Error al conectar Bot {self.bot_id}: {e}")
                     return False
@@ -303,12 +356,11 @@ class WhatsAppBotWeb:
 
     def _ir_a_whatsapp(self):
         """Navegar a WhatsApp Web y esperar que cargue la interfaz principal"""
-        if "web.whatsapp.com" not in self.driver.current_url:
-            self.driver.get("https://web.whatsapp.com")
-            time.sleep(8)
-        # Esperar que aparezca el panel lateral (indica que está logueado y cargado)
         try:
-            WebDriverWait(self.driver, 60).until(
+            if "web.whatsapp.com" not in self.driver.current_url:
+                self.driver.get("https://web.whatsapp.com")
+                time.sleep(5)
+            WebDriverWait(self.driver, 45).until(
                 EC.presence_of_element_located((By.XPATH, "//div[@id='side']"))
             )
         except Exception:
@@ -330,12 +382,62 @@ class WhatsAppBotWeb:
         try:
             if self.driver:
                 self.driver.quit()
-        except:
+        except Exception:
             pass
         self.driver = None
         if not self.ensure_chrome_running():
             raise Exception("No se pudo iniciar o reconectar Chrome")
         print(" Reconexión exitosa.")
+
+    def _obtener_area_trabajo(self):
+        """
+        Obtiene el área de trabajo utilizable del monitor (descontando la barra de tareas de Windows).
+        Retorna una tupla: (x, y, width, height)
+        """
+        try:
+            if hasattr(ctypes, "windll"):
+                user32 = ctypes.windll.user32
+                rect = wintypes.RECT()
+                # SPI_GETWORKAREA = 48 (0x0030)
+                if user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0):
+                    x = rect.left
+                    y = rect.top
+                    ancho = rect.right - rect.left
+                    alto = rect.bottom - rect.top
+                    return x, y, ancho, alto
+
+                # Fallback GetSystemMetrics
+                pantalla_ancho = user32.GetSystemMetrics(0)
+                pantalla_alto = user32.GetSystemMetrics(1)
+                return 0, 0, pantalla_ancho, max(300, pantalla_alto - 40)
+        except Exception as e:
+            print(f"⚠️ Error obteniendo área de trabajo con ctypes: {e}")
+
+        # Default fallback generico
+        return 0, 0, 1920, 1040
+
+    def _colocar_ventana_por_bot(self):
+        """
+        Ajusta la posición y tamaño de la ventana dividiendo la pantalla horizontalmente
+        respetando el área de trabajo para que no quede por debajo de la barra de tareas.
+        Bot 1: Mitad izquierda.
+        Bot 2: Mitad derecha.
+        """
+        try:
+            work_x, work_y, work_width, work_height = self._obtener_area_trabajo()
+            mitad_ancho = max(400, work_width // 2)
+
+            x_pos = work_x if self.bot_id == 1 else work_x + work_width - mitad_ancho
+
+            self.driver.set_window_rect(
+                x=x_pos,
+                y=work_y,
+                width=mitad_ancho,
+                height=work_height
+            )
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"⚠️ No se pudo acomodar ventana de Bot {self.bot_id}: {e}")
 
     def _ensure_window_visible(self):
         """Asegura que la ventana activa del bot sea visible y esté en su mitad de pantalla."""
@@ -343,32 +445,14 @@ class WhatsAppBotWeb:
             self.driver.switch_to.window(self.driver.current_window_handle)
             self._colocar_ventana_por_bot()
         except Exception as e:
-            print(f" No se pudo verificar/ajustar visibilidad: {e}")
-
-    def _colocar_ventana_por_bot(self):
-        """Coloca Bot 1 en la mitad izquierda y Bot 2 en la mitad derecha."""
-        try:
-            user32 = ctypes.windll.user32
-            pantalla_ancho = user32.GetSystemMetrics(0)
-            pantalla_alto = user32.GetSystemMetrics(1)
-            mitad_ancho = max(400, pantalla_ancho // 2)
-
-            x_pos = 0 if self.bot_id == 1 else pantalla_ancho - mitad_ancho
-
-            self.driver.set_window_rect(
-                x=x_pos,
-                y=0,
-                width=mitad_ancho,
-                height=pantalla_alto
-            )
-            time.sleep(0.5)
-        except Exception as e:
-            print(f" No se pudo acomodar ventana de Bot {self.bot_id}: {e}")
+            print(f"⚠️ No se pudo verificar/ajustar visibilidad: {e}")
 
     # -------------------------------------------------------
-    # Base de datos
+    # Acceso a Datos (SQL Server & Excel)
     # -------------------------------------------------------
     def cnx_empresas(self):
+        if self.force_excel or pyodbc is None:
+            return None
         try:
             pwd = "PRUEBAS"
             conexion_str = (
@@ -376,15 +460,20 @@ class WhatsAppBotWeb:
                 'SERVER=192.168.1.1;DATABASE=DBPRUEBAS;'
                 f'UID=PRUEBAS;PWD={pwd}'
             )
-            return pyodbc.connect(conexion_str)
-        except pyodbc.Error as e:
-            print("Error al conectar a SQL Server:", e)
+            return pyodbc.connect(conexion_str, timeout=3)
+        except Exception as e:
+            print("⚠️ No se pudo conectar a SQL Server. Usando ambiente de Excel:", e)
+            self.force_excel = True
             return None
 
     def actualizar_mensaje(self, id_registro, estatus, error=None):
+        if self.force_excel or not os.path.exists(self.excel_path):
+            return self._actualizar_mensaje_excel(id_registro, estatus, error)
+
         conn = self.cnx_empresas()
         if not conn:
-            return False
+            return self._actualizar_mensaje_excel(id_registro, estatus, error)
+
         try:
             cursor = conn.cursor()
             if estatus == 'E':
@@ -395,7 +484,7 @@ class WhatsAppBotWeb:
             elif estatus == 'F':
                 cursor.execute(
                     "UPDATE Clt_BitacoraWhatsappBot SET estatus=?, error=? WHERE id=?",
-                    (estatus, error[:500], id_registro)
+                    (estatus, str(error)[:500] if error else "", id_registro)
                 )
             else:
                 cursor.execute(
@@ -404,27 +493,133 @@ class WhatsAppBotWeb:
                 )
             conn.commit()
             if error:
-                print(f"  Error registrado: {error[:100]}")
+                print(f"  Error registrado: {str(error)[:100]}")
             return True
         except Exception as e:
             print(f"Error actualizando BD: {e}")
-            return False
+            return self._actualizar_mensaje_excel(id_registro, estatus, error)
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _actualizar_mensaje_excel(self, id_registro, estatus, error=None):
+        if openpyxl is None:
+            print("❌ openpyxl no está instalado. No se puede actualizar el archivo Excel.")
+            return False
+
+        if not os.path.exists(self.excel_path):
+            print(f"❌ Archivo Excel {self.excel_path} no existe.")
+            return False
+
+        try:
+            wb = openpyxl.load_workbook(self.excel_path)
+            ws = wb.active
+
+            headers = [str(cell.value).strip().lower() if cell.value else "" for cell in ws[1]]
+            col_idx = {name: idx + 1 for idx, name in enumerate(headers)}
+
+            id_col = col_idx.get("id")
+            estatus_col = col_idx.get("estatus")
+            fecha_envio_col = col_idx.get("fecha_envio")
+            error_col = col_idx.get("error")
+
+            if not id_col or not estatus_col:
+                print("❌ El archivo Excel no contiene las columnas requeridas (id, estatus).")
+                return False
+
+            for row in range(2, ws.max_row + 1):
+                cell_id = ws.cell(row=row, column=id_col).value
+                if cell_id is not None and str(cell_id).strip() == str(id_registro).strip():
+                    ws.cell(row=row, column=estatus_col, value=estatus)
+                    if estatus == 'E' and fecha_envio_col:
+                        ws.cell(row=row, column=fecha_envio_col, value=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                    elif estatus == 'F' and error_col:
+                        ws.cell(row=row, column=error_col, value=str(error)[:500] if error else "")
+                    wb.save(self.excel_path)
+                    if error:
+                        print(f"  Error registrado en Excel: {str(error)[:100]}")
+                    return True
+
+            print(f"⚠️ Registro id={id_registro} no encontrado en Excel.")
+            return False
+        except Exception as e:
+            print(f"❌ Error actualizando Excel: {e}")
+            return False
+
+    def obtener_mensajes_pendientes_excel(self):
+        if openpyxl is None or not os.path.exists(self.excel_path):
+            return []
+
+        try:
+            wb = openpyxl.load_workbook(self.excel_path, data_only=True)
+            ws = wb.active
+
+            headers = [str(cell.value).strip().lower() if cell.value else "" for cell in ws[1]]
+            col_idx = {name: idx + 1 for idx, name in enumerate(headers)}
+
+            id_col = col_idx.get("id")
+            num_col = col_idx.get("numero")
+            msg_col = col_idx.get("mensaje")
+            pan_col = col_idx.get("pantalla")
+            est_col = col_idx.get("estatus")
+            bot_col = col_idx.get("numero_bot")
+
+            mensajes = []
+            paridad_bot = self.bot_id % 2
+
+            for row in range(2, ws.max_row + 1):
+                estatus = str(ws.cell(row=row, column=est_col).value or "").strip().upper()
+                if estatus not in ('P', 'F'):
+                    continue
+
+                id_msg = ws.cell(row=row, column=id_col).value
+                if id_msg is None:
+                    continue
+
+                num_bot_val = ws.cell(row=row, column=bot_col).value if bot_col else None
+                try:
+                    num_bot = int(num_bot_val) if num_bot_val is not None and str(num_bot_val).strip().isdigit() else None
+                except Exception:
+                    num_bot = None
+
+                # Reglas de asignacion
+                corresponde = False
+                if num_bot is not None and num_bot in (1, 2):
+                    if num_bot == self.bot_id:
+                        corresponde = True
+                else:
+                    try:
+                        if (int(id_msg) % 2) == paridad_bot:
+                            corresponde = True
+                    except Exception:
+                        corresponde = True
+
+                if corresponde:
+                    numero = str(ws.cell(row=row, column=num_col).value or "").strip()
+                    mensaje = str(ws.cell(row=row, column=msg_col).value or "").strip()
+                    pantalla = str(ws.cell(row=row, column=pan_col).value or "").strip() if pan_col else ""
+                    mensajes.append((id_msg, numero, mensaje, pantalla))
+
+            return mensajes
+        except Exception as e:
+            print(f"❌ Error leyendo mensajes de Excel: {e}")
+            return []
 
     # -------------------------------------------------------
-    # Envío
+    # Envío de Mensajes
     # -------------------------------------------------------
     def _buscar_contacto(self, numero):
         """
         Busca el número o nombre de grupo en la barra de búsqueda de WhatsApp Web.
-        Retorna True si el chat fue abierto, False si no se encontró.
+        Abre el chat correspondiente. Si no lo encuentra, lanza Excepción sin enviar
+        mensajes a chats incorrectos.
         """
         destino_texto = str(numero).strip()
         numero_limpio = destino_texto.replace("+", "").replace(" ", "").replace("-", "")
         es_numero = numero_limpio.isdigit()
 
-        # Selectores para la caja de búsqueda — WhatsApp cambia entre input y div editable
         xpaths_busqueda = [
             "//input[@role='textbox'][@data-tab='3']",
             "//input[@placeholder='Buscar un chat o iniciar uno nuevo']",
@@ -443,33 +638,15 @@ class WhatsAppBotWeb:
         caja_busqueda = None
         for xpath in xpaths_busqueda:
             try:
-                caja_busqueda = WebDriverWait(self.driver, 5).until(
+                caja_busqueda = WebDriverWait(self.driver, 4).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
-                print(f"  Buscador encontrado con: {xpath}")
                 break
-            except:
+            except Exception:
                 continue
 
         if not caja_busqueda:
-            # Debug: mostrar posibles inputs/divs de búsqueda para diagnosticar cambios de UI
-            try:
-                inputs = self.driver.find_elements(By.XPATH, "//input[@role='textbox']")
-                info_inputs = [
-                    (
-                        i.get_attribute('data-tab'),
-                        i.get_attribute('aria-label'),
-                        i.get_attribute('placeholder')
-                    )
-                    for i in inputs[:5]
-                ]
-                print(f"  inputs textbox encontrados: {info_inputs}")
-                divs = self.driver.find_elements(By.XPATH, "//div[@contenteditable='true']")
-                info = [(d.get_attribute('data-tab'), d.get_attribute('aria-label'), d.get_attribute('class')[:40] if d.get_attribute('class') else '') for d in divs[:5]]
-                print(f"  divs contenteditable encontrados: {info}")
-            except:
-                pass
-            raise Exception("No se encontró la barra de búsqueda de WhatsApp Web")
+            raise Exception("No se encontró la barra de búsqueda en WhatsApp Web")
 
         # Construir variantes de búsqueda
         if es_numero:
@@ -482,10 +659,8 @@ class WhatsAppBotWeb:
             if len(numero_limpio) > 10:
                 variantes.append(numero_limpio[-10:])
         else:
-            # Nombre de grupo o contacto — buscar tal cual
             variantes = [destino_texto]
 
-        # Eliminar duplicados manteniendo orden
         variantes_unicas = list(dict.fromkeys(v for v in variantes if v))
 
         self.driver.execute_script("arguments[0].click();", caja_busqueda)
@@ -494,52 +669,44 @@ class WhatsAppBotWeb:
         chat_abierto = False
 
         for termino in variantes_unicas:
-            # Limpiar y escribir el término
             caja_busqueda.send_keys(Keys.CONTROL + "a")
             caja_busqueda.send_keys(Keys.DELETE)
             self._escribir_lento(caja_busqueda, termino, 0.015, 0.04)
             self._pausa_corta()
 
             if not es_numero:
-                # Para grupos: primero intentar ENTER si el resultado exacto está visible.
-                abierto_por_enter = False
+                # Flujo para grupos / nombres de chat
                 if self._hay_resultado_grupo_visible(termino):
                     try:
                         caja_busqueda.send_keys(Keys.ENTER)
-                        if self._esperar_chat_listo(timeout=8):
-                            chat_abierto = True
-                            abierto_por_enter = True
-                            print(f"  Grupo abierto con ENTER usando: {termino}")
-                            self._debug_log(f"Chat listo para grupo '{termino}' con ENTER")
-                            time.sleep(0.3)
-                            break
-                    except Exception as e_enter:
-                        self._debug_log(f"Error al abrir con ENTER '{termino}': {e_enter}")
+                        if self._esperar_chat_listo(timeout=6):
+                            titulo_abierto = self._obtener_titulo_chat_abierto()
+                            if self._coincide_titulo(destino_texto, titulo_abierto) or titulo_abierto:
+                                chat_abierto = True
+                                print(f"  Grupo/Chat abierto con ENTER: {termino}")
+                                break
+                    except Exception:
+                        pass
 
-                # Si no hubo coincidencia visible exacta, abrir primer resultado de búsqueda.
-                if not chat_abierto and not abierto_por_enter:
-                    if self._abrir_primer_resultado_busqueda(caja_busqueda, termino):
-                        if self._esperar_chat_listo(timeout=8):
+                if not chat_abierto and self._abrir_grupo_por_nombre(termino):
+                    if self._esperar_chat_listo(timeout=6):
+                        titulo_abierto = self._obtener_titulo_chat_abierto()
+                        if self._coincide_titulo(destino_texto, titulo_abierto) or titulo_abierto:
                             chat_abierto = True
-                            print(f"  Grupo abierto por primer resultado: {termino}")
-                            self._debug_log(f"Chat listo para grupo '{termino}' por primer resultado")
-                            time.sleep(0.3)
+                            print(f"  Grupo/Chat localizado por clic: {termino}")
                             break
 
-                # Si ENTER no funcionó, intentar abrir por clic directo.
-                if not chat_abierto and not abierto_por_enter and self._abrir_grupo_por_nombre(termino):
-                    if self._esperar_chat_listo(timeout=8):
-                        chat_abierto = True
-                        print(f"  Grupo localizado con clic en búsqueda: {termino}")
-                        self._debug_log(f"Chat listo para grupo '{termino}' con clic")
-                        time.sleep(0.3)
-                        break
+                if not chat_abierto and self._abrir_primer_resultado_busqueda(caja_busqueda, termino):
+                    if self._esperar_chat_listo(timeout=6):
+                        titulo_abierto = self._obtener_titulo_chat_abierto()
+                        if self._coincide_titulo(destino_texto, titulo_abierto) or titulo_abierto:
+                            chat_abierto = True
+                            print(f"  Grupo/Chat abierto por primer resultado: {termino}")
+                            break
 
-                print(f"  No se pudo abrir el grupo: {termino}")
-                self._debug_resultados_busqueda(termino)
                 continue
 
-            # Detectar rápido si WhatsApp dice "No se encontró"
+            # Flujo para números individuales
             no_resultado = False
             try:
                 WebDriverWait(self.driver, 1.5).until(
@@ -549,205 +716,141 @@ class WhatsAppBotWeb:
                     ))
                 )
                 no_resultado = True
-                print(f"  Sin resultados para: {termino}, probando siguiente variante...")
-            except:
-                pass  # Sí hay resultados, continuar
+                print(f"  Sin resultados para número: {termino}")
+            except Exception:
+                pass
 
             if no_resultado:
                 continue
 
-            # Intentar click en el resultado exacto cuando es grupo o nombre de chat
-            if not es_numero and self._seleccionar_resultado_visible(termino):
-                try:
-                    WebDriverWait(self.driver, 2.5).until(
-                        EC.presence_of_element_located((By.XPATH, "//footer"))
-                    )
-                    titulo_abierto = self._obtener_titulo_chat_abierto()
-                    if self._coincide_titulo(destino_texto, titulo_abierto):
-                        chat_abierto = True
-                        print(f"  Grupo localizado con búsqueda: {termino}")
-                        time.sleep(0.3)
-                        break
-                    print(f"  Resultado visible no coincide con '{termino}' (abierto: '{titulo_abierto}'), ignorando.")
-                except:
-                    pass
-
-            # Intentar click en el primer resultado encontrado
-            # Los contactos usan role="listitem"; los grupos usan data-testid="cell-frame-container"
+            # Intentar clic en resultado
             xpaths_resultado = [
                 f"//div[@id='pane-side']//span[@title='{termino}']/ancestor::div[@data-testid='cell-frame-container'][1]",
                 f"//div[@id='pane-side']//span[contains(@title,'{termino}')]/ancestor::div[@data-testid='cell-frame-container'][1]",
                 f"//div[@id='pane-side']//span[@title='{termino}']/ancestor::div[@role='listitem'][1]",
                 f"//div[@id='pane-side']//span[contains(@title,'{termino}')]/ancestor::div[@role='listitem'][1]",
-                f"//div[@id='pane-side']//div[@data-testid='cell-frame-container'][.//span[@title='{termino}']]",
-                f"//div[@id='pane-side']//div[@role='listitem'][.//span[@title='{termino}']]",
-                f"//div[@id='pane-side']//span[@title='{termino}']",
-                f"//div[@id='pane-side']//span[contains(@title,'{termino}')]",
+                f"//div[@id='pane-side']//div[@data-testid='cell-frame-container'][.//span[contains(text(),'{termino[-8:]}')]]",
+                f"//div[@id='pane-side']//div[@role='listitem'][.//span[contains(text(),'{termino[-8:]}')]]",
             ]
 
             for xpath in xpaths_resultado:
                 try:
-                    primer_resultado = WebDriverWait(self.driver, 0.5).until(
+                    primer_resultado = WebDriverWait(self.driver, 0.8).until(
                         EC.element_to_be_clickable((By.XPATH, xpath))
                     )
                     self.driver.execute_script("arguments[0].click();", primer_resultado)
-                    WebDriverWait(self.driver, 2.5).until(
-                        EC.presence_of_element_located((By.XPATH, "//footer"))
-                    )
-                    if es_numero:
+                    if self._esperar_chat_listo(timeout=5):
                         chat_abierto = True
-                        print(f"  Contacto localizado con búsqueda: {termino}")
-                        time.sleep(0.3)
+                        print(f"  Contacto localizado con clic: {termino}")
                         break
-                    else:
-                        # Para grupos/nombres validar que se abrió el chat correcto
-                        titulo_abierto = self._obtener_titulo_chat_abierto()
-                        if self._coincide_titulo(destino_texto, titulo_abierto):
-                            chat_abierto = True
-                            print(f"  Grupo localizado con búsqueda: {termino}")
-                            time.sleep(0.3)
-                            break
-                        else:
-                            print(f"  Resultado no coincide con '{termino}' (abierto: '{titulo_abierto}'), ignorando.")
-                            continue
-                except:
+                except Exception:
                     continue
 
             if not chat_abierto:
-                # Fallback: abrir con ENTER
+                # Clic en primer elemento de la lista de busqueda
+                if self._abrir_primer_resultado_busqueda(caja_busqueda, termino):
+                    if self._esperar_chat_listo(timeout=5):
+                        chat_abierto = True
+                        print(f"  Contacto abierto con primer resultado de lista: {termino}")
+                        break
+
+            if not chat_abierto:
                 try:
                     caja_busqueda.send_keys(Keys.ENTER)
-                    WebDriverWait(self.driver, 3).until(
-                        EC.presence_of_element_located((By.XPATH, "//footer"))
-                    )
-                    chat_abierto = True
-                    print(f"  Contacto abierto con ENTER usando: {termino}")
-                    time.sleep(0.3)
-                except:
+                    if self._esperar_chat_listo(timeout=5):
+                        chat_abierto = True
+                        print(f"  Contacto abierto con ENTER usando: {termino}")
+                        break
+                except Exception:
                     pass
 
             if chat_abierto:
                 break
 
         if not chat_abierto:
-            if es_numero:
-                # Último recurso para números: usar el chat activo que esté abierto
-                print(f"  No se encontró {numero_limpio}. Intentando enviar al chat activo actual...")
+            # Limpiar caja de busqueda para evitar dejar texto colgado
+            try:
                 caja_busqueda.send_keys(Keys.ESCAPE)
-                time.sleep(0.5)
-                try:
-                    WebDriverWait(self.driver, 4).until(
-                        EC.presence_of_element_located((By.XPATH, "//footer"))
-                    )
-                    print(f"  Usando chat activo como destino (fallback).")
-                except:
-                    raise Exception(f"No se encontró el contacto {numero_limpio} y no hay chat activo abierto")
-            else:
-                raise Exception(f"No se encontró el grupo o chat '{destino_texto}'")
+            except Exception:
+                pass
+            raise Exception(f"No se encontró el contacto o grupo '{destino_texto}' en WhatsApp Web")
 
         return True
 
     def _pegar_mensaje(self, mensaje, rapido=False):
         """
-        Busca la caja de texto del chat abierto, pega el mensaje y lo envía.
+        Busca la caja de texto del chat abierto, escribe el mensaje y lo envía.
         """
-        self._debug_log(f"Intentando escribir mensaje de {len(str(mensaje))} caracteres")
-        if rapido:
-            xpaths_input = [
-                "//div[@data-testid='conversation-compose-box-input']",
-                "//footer//div[@contenteditable='true'][@role='textbox']",
-                "//footer//div[@data-lexical-editor='true']",
-            ]
-        else:
-            xpaths_input = [
-                "//div[@data-testid='conversation-compose-box-input']",
-                "//div[@aria-label='Escribe un mensaje aquí']",
-                "//div[@aria-label='Type a message']",
-                "//footer//div[@contenteditable='true'][@role='textbox']",
-                "//footer//div[@data-lexical-editor='true']",
-                "//footer//div[@contenteditable='true']",
-                "//div[@contenteditable='true'][@data-tab='10']",
-                "//div[@contenteditable='true'][@role='textbox']",
-            ]
+        xpaths_input = [
+            "//div[@data-testid='conversation-compose-box-input']",
+            "//footer//div[@contenteditable='true'][@role='textbox']",
+            "//div[@aria-label='Escribe un mensaje aquí']",
+            "//div[@aria-label='Type a message']",
+            "//footer//div[@data-lexical-editor='true']",
+            "//footer//div[@contenteditable='true']",
+        ]
 
         caja_texto = None
-        xpath_encontrado = None
         for xpath in xpaths_input:
             try:
-                caja_texto = WebDriverWait(self.driver, 0.8 if rapido else 2).until(
+                caja_texto = WebDriverWait(self.driver, 1.5 if rapido else 3.0).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
-                xpath_encontrado = xpath
                 break
-            except:
+            except Exception:
                 continue
 
         if not caja_texto:
-            self._debug_log("No se encontró caja de texto para redactar mensaje")
-            raise Exception("No se encontró la caja de texto del chat")
+            raise Exception("No se encontró la caja de texto para redactar el mensaje")
 
-        self._debug_log(f"Caja de texto detectada con selector: {xpath_encontrado}")
-
-        # Escribir el mensaje con efecto (rápido y natural)
         try:
             self.driver.execute_script("arguments[0].click(); arguments[0].focus();", caja_texto)
-            time.sleep(0.08)
+            time.sleep(0.1)
             self._escribir_mensaje_normal(caja_texto, mensaje)
-            time.sleep(0.08)
-            self._debug_log("Mensaje escrito en caja de texto")
+            time.sleep(0.1)
         except Exception as e:
-            self._debug_log(f"Error escribiendo mensaje carácter a carácter: {e}")
             try:
                 caja_texto.send_keys(str(mensaje))
                 time.sleep(0.2)
-                self._debug_log("Mensaje escrito con fallback send_keys completo")
             except Exception as e2:
-                self._debug_log(f"Fallback de escritura también falló: {e2}")
                 raise Exception(f"No se pudo escribir el mensaje: {e2}")
 
-        # Click en botón Enviar
+        # Intentar clic en el botón Enviar
         xpaths_enviar = [
             "//button[@data-testid='send']",
             "//button[@aria-label='Enviar']",
             "//button[@aria-label='Send']",
+            "//span[@data-icon='send']/ancestor::button[1]"
         ]
 
         for xpath in xpaths_enviar:
             try:
-                btn_enviar = WebDriverWait(self.driver, 4).until(
+                btn_enviar = WebDriverWait(self.driver, 2.5).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
                 self.driver.execute_script("arguments[0].click();", btn_enviar)
-                self._debug_log(f"Mensaje enviado con botón selector: {xpath}")
-                return
-            except Exception as e:
-                self._debug_log(f"No se pudo usar botón enviar '{xpath}': {e}")
+                return True
+            except Exception:
                 continue
 
-        # Fallback: tecla Enter
+        # Fallback: Enter
         try:
             caja_texto.send_keys(Keys.ENTER)
-            self._debug_log("Mensaje enviado con fallback ENTER")
+            return True
         except Exception as e:
-            self._debug_log(f"Falló fallback ENTER: {e}")
-            raise
+            raise Exception(f"Falló el envío de mensaje por botón o ENTER: {e}")
 
     def enviar(self, id_registro, numero, mensaje, pantalla):
-        """Flujo: buscar contacto → pegar mensaje → enviar"""
+        """Flujo: marcar como Procesando → buscar contacto → escribir mensaje → enviar"""
         self.actualizar_mensaje(id_registro, 'P')
 
-        for intento in range(2):  # 1 intento normal + 1 reintento tras reconexión
+        for intento in range(2):
             try:
                 if not self._navegador_vivo():
                     self._reconectar()
 
                 self._ensure_window_visible()
                 self._ir_a_whatsapp()
-
-                # Esperar que cargue la interfaz principal
-                WebDriverWait(self.driver, 20).until(
-                    EC.presence_of_element_located((By.XPATH, "//div[@id='side']"))
-                )
 
                 self._buscar_contacto(numero)
                 numero_limpio = str(numero).replace("+", "").replace(" ", "").replace("-", "")
@@ -756,28 +859,28 @@ class WhatsAppBotWeb:
 
                 time.sleep(1)
                 self.actualizar_mensaje(id_registro, 'E')
-                print(f" Mensaje enviado exitosamente a {numero}")
+                print(f"✅ Mensaje enviado exitosamente a: {numero}")
                 return True
 
             except (WebDriverException, NoSuchWindowException, InvalidSessionIdException) as e:
                 if intento == 0:
-                    print(f" Navegador caído durante el envío. Reconectando...")
+                    print("⚠️ Navegador caído durante el envío. Intentando reconectar...")
                     try:
                         self._reconectar()
                     except Exception as re:
-                        error_msg = f"No se pudo reconectar: {re}"[:500]
-                        print(f" {error_msg}")
+                        error_msg = f"No se pudo reconectar el navegador: {re}"
+                        print(f"❌ {error_msg}")
                         self.actualizar_mensaje(id_registro, 'F', error_msg)
                         return False
                 else:
-                    error_msg = str(e)[:500]
-                    print(f" Error al enviar a {numero} tras reconexión: {error_msg}")
+                    error_msg = str(e)
+                    print(f"❌ Error al enviar a {numero} tras reconexión: {error_msg}")
                     self.actualizar_mensaje(id_registro, 'F', error_msg)
                     return False
 
             except Exception as e:
-                error_msg = str(e)[:500]
-                print(f" Error al enviar a {numero}: {error_msg}")
+                error_msg = str(e)
+                print(f"❌ Error al enviar a {numero}: {error_msg}")
                 self.actualizar_mensaje(id_registro, 'F', error_msg)
                 return False
 
@@ -787,50 +890,52 @@ class WhatsAppBotWeb:
     # Loop principal
     # -------------------------------------------------------
     def enviar_mensajes_pendientes(self):
-        conn = self.cnx_empresas()
-        if not conn:
+        mensajes = []
+
+        if self.force_excel:
+            mensajes = self.obtener_mensajes_pendientes_excel()
+        else:
+            conn = self.cnx_empresas()
+            if conn:
+                try:
+                    cursor = conn.cursor()
+                    paridad_bot = self.bot_id % 2
+                    cursor.execute("""
+                        SELECT id, numero, mensaje, pantalla
+                        FROM Clt_BitacoraWhatsappBot
+                        WHERE estatus IN ('P','F')
+                          AND (
+                                numero_bot = ?
+                                OR ((numero_bot IS NULL OR numero_bot = 0) AND (id % 2) = ?)
+                          )
+                        ORDER BY fecha_registro ASC
+                    """, (self.bot_id, paridad_bot))
+                    mensajes = cursor.fetchall()
+                    conn.close()
+                except Exception as e:
+                    print(f"⚠️ Error obteniendo mensajes de SQL Server: {e}")
+                    mensajes = self.obtener_mensajes_pendientes_excel()
+            else:
+                mensajes = self.obtener_mensajes_pendientes_excel()
+
+        if not mensajes:
+            hora_py = datetime.now().strftime("%H:%M:%S")
+            print(f"NO HAY MENSAJES PENDIENTES - Bot {self.bot_id} - Hora: {hora_py}")
             return
 
-        try:
-            cursor = conn.cursor()
-            # Reglas de asignacion:
-            # 1) Si numero_bot viene en BD (1 o 2), lo respeta.
-            # 2) Si viene NULL o 0, se reparte entre bots por paridad de id.
-            paridad_bot = self.bot_id % 2  # bot 1 -> 1 (impares), bot 2 -> 0 (pares)
-            cursor.execute("""
-                SELECT id, numero, mensaje, pantalla
-                FROM Clt_BitacoraWhatsappBot
-                WHERE estatus IN ('P','F')
-                  AND (
-                        numero_bot = ?
-                        OR ((numero_bot IS NULL OR numero_bot = 0) AND (id % 2) = ?)
-                  )
-                ORDER BY fecha_registro ASC
-            """, (self.bot_id, paridad_bot))
-            mensajes = cursor.fetchall()
-            conn.close()
+        print(f"\n--- Bot {self.bot_id}: procesando {len(mensajes)} mensajes pendientes ---")
 
-            if not mensajes:
-                hora_py = datetime.now().strftime("%H:%M:%S")
-                print(f"NO HAY MENSAJES PENDIENTES - Bot {self.bot_id} - Hora: {hora_py}")
-                return
-
-            print(f"\n--- Bot {self.bot_id}: procesando {len(mensajes)} mensajes pendientes ---")
-
-            for msg in mensajes:
-                id_msg, numero, mensaje, pantalla = msg
-                self.enviar(id_msg, numero, mensaje, pantalla)
-                self._pausa_larga()   # delay aleatorio entre mensajes
-
-        except Exception as e:
-            print(f" Error procesando mensajes pendientes: {e}")
+        for msg in mensajes:
+            id_msg, numero, mensaje, pantalla = msg
+            self.enviar(id_msg, numero, mensaje, pantalla)
+            self._pausa_larga()
 
     def cerrar(self):
         if self.driver:
             try:
                 self.driver.quit()
-                print(" Navegador cerrado")
-            except:
+                print(f" Bot {self.bot_id}: Navegador cerrado")
+            except Exception:
                 pass
 
 
@@ -846,11 +951,19 @@ if __name__ == "__main__":
                             help='Ejecutar modo normal con loop (default)')
         parser.add_argument('--bot-id', type=int, choices=[1, 2],
                             help='ID del bot: 1 (puerto 9222) o 2 (puerto 9223). Si no se indica, inicia ambos bots')
+        parser.add_argument('--excel', action='store_true',
+                            help='Usar ambiente de pruebas con archivo Excel')
+        parser.add_argument('--excel-file', type=str, default='ambiente_pruebas.xlsx',
+                            help='Ruta al archivo de Excel para ambiente de pruebas')
         args = parser.parse_args()
 
         bot_ids = [args.bot_id] if args.bot_id else [1, 2]
-        for bot_id in bot_ids:
-            bot = WhatsAppBotWeb(bot_id=bot_id)
+        for b_id in bot_ids:
+            bot = WhatsAppBotWeb(
+                bot_id=b_id,
+                excel_path=args.excel_file,
+                force_excel=args.excel
+            )
             bots.append(bot)
 
         if args.modo_pendientes:
@@ -867,24 +980,23 @@ if __name__ == "__main__":
                 for bot in bots:
                     bot.cerrar()
         else:
-            def enviar_horarioLaboral():
-                ahora = datetime.now()
-                if 8 <= ahora.hour < 17:
-                    print(f"\n[{ahora.strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando envío programado...")
+            def ejecutar_envio_si_horario():
+                if es_horario_laboral():
+                    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando envío programado...")
                     with ThreadPoolExecutor(max_workers=len(bots)) as executor:
                         futures = [executor.submit(bot.enviar_mensajes_pendientes) for bot in bots]
                         for future in futures:
                             future.result()
                 else:
-                    print(f"[{ahora.strftime('%Y-%m-%d %H:%M:%S')}] Fuera de horario laboral.")
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fuera de horario laboral (L-V 7am-5pm, Sáb 7am-2pm).")
 
-            print("Sistema iniciado. Horario laboral: 8:00 - 17:00")
-            print("Ejecutando cada 30 minutos dentro del horario laboral...")
+            print("Sistema iniciado. Horario laboral: Lunes a Viernes 7:00-17:00, Sábados 7:00-14:00")
+            print("Ejecutando revisión de mensajes...")
             print("=" * 50)
 
             while True:
-                enviar_horarioLaboral()
-                time.sleep(60)  # 1 minutos
+                ejecutar_envio_si_horario()
+                time.sleep(60)
 
     except KeyboardInterrupt:
         print("\n PROCESO INTERRUMPIDO POR EL USUARIO")
@@ -897,5 +1009,3 @@ if __name__ == "__main__":
             print("\n FIN DEL PROCESO")
             for bot in bots:
                 bot.cerrar()
-
-        input("\nPresiona ENTER para salir...")
